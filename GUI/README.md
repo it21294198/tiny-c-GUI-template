@@ -1,65 +1,67 @@
-### Compile on your Mac
-No Homebrew installation is required.
+### This version includes:
+- Native macOS window.
+- Labels and buttons.
+- Editable text fields.
+- Checkboxes.
+- Sliders.
+- Button click detection.
+- Text and widget state access.
+- Nested rows, columns and containers.
+- Padding, spacing and alignment.
+- Manual Cocoa event polling.
+Important: This is a C API implemented using Objective-C and AppKit. Compile it using Clang's Objective-C mode. You don't need any third-party libraries.
+
+### Compile
+From your GUI directory:
 ```bash
-clang -std=c11 -Wall -Wextra main.c \
+clang -x objective-c -std=c11 \
+    -fno-objc-arc \
+    -Wall -Wextra \
+    main.c \
     -o tinygui \
     -framework AppKit \
-    -framework Foundation \
-    -lobjc
+    -framework Foundation
 ```
 
-### Run:
+Run:
 ```bash
 ./tinygui
 ```
 
-
-You should get a native macOS window measuring 900 × 600 pixels.
-### Important: Add an autorelease pool
-Because we're calling Cocoa from C, we should manage Objective-C autoreleased objects.
-
-Add this global variable:
+4. Project structure
 ```bash
-static id tg_pool = nil;
+tinyGUI/
+│
+├── CLI/
+│   ├── main.c
+│   ├── tinygui.h
+│   └── README.md
+│
+└── GUI/
+    ├── main.c
+    ├── tinygui.h
+    └── README.md
 ```
 
-At the beginning of tg_init(), before creating NSApplication:
+5. Important implementation notes
 ```bash
-id pool_class = (id)TG_CLASS("NSAutoreleasePool");
-
-tg_pool = TG_MSG(id, "alloc")
-    (pool_class, TG_SEL("alloc"));
-
-tg_pool = TG_MSG(id, "init")
-    (tg_pool, TG_SEL("init"));
-
-
-At the end of tg_shutdown(), before returning:
-if (tg_pool) {
-    TG_MSG(void, "drain")
-        (tg_pool, TG_SEL("drain"));
-
-    tg_pool = nil;
-}
+Feature	Current implementation
+Native window	Implemented
+Native labels	Implemented
+Native buttons	Implemented
+Button callbacks/state	Implemented
+Text fields	Implemented
+Checkboxes	Implemented
+Sliders	Implemented
+Rows and columns	Basic
+Nested containers	Basic
+Padding and spacing	Implemented
+Responsive resizing	Not implemented
 ```
 
-### Development roadmap
-1. Current
-    Native window management
-   
-   Window creation, event loop and cleanup.
-2. Native widgets
-   
-   Labels, buttons, text fields, checkboxes and sliders using Cocoa controls.
-3. TinyGUI rendering API
-   
-   tg_button(), tg_label(), tg_checkbox() and tg_textbox().
-4. Layout engine
-   
-   Rows, columns, padding, alignment and containers.
-5. Styling engine
-   
-   Colors, typography, themes and custom styles.
-Our design goal: Application developers should only need tinygui.h and a C compiler. TinyGUI itself will handle the native macOS integration.
+Two usage details:
 
-One distinction: the implementation is a single-header C API, but it links to Apple's system frameworks and Objective-C runtime. It is not a standard-C-only implementation.
+1. Call tg_begin(), create your widgets, and call tg_end() once. This version retains native widgets rather than recreating them every frame.
+2. Use tg_poll() when you need to inspect button clicks or widget values. tg_run() is a blocking event loop and does not give your application a chance to execute its own per-event logic.
+
+* This is our initial consolidated implementation, not yet a fully tested production release. In particular, layout resizing and advanced nested layout behavior still need further testing.

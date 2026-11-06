@@ -2,11 +2,40 @@
 #ifndef TINYGUI_H
 #define TINYGUI_H
 
+/*
+ * TinyGUI v0.2
+ * Native macOS GUI library
+ *
+ * Public API: C
+ * Backend: Cocoa / AppKit
+ *
+ * Define TINYGUI_IMPLEMENTATION in ONE source file.
+ * Compile using: clang -x objective-c
+ */
+
 #include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* =========================================================
+   PUBLIC TYPES
+   ========================================================= */
+
+typedef struct TG_Widget TG_Widget;
+
+typedef enum {
+    TG_ALIGN_START,
+    TG_ALIGN_CENTER,
+    TG_ALIGN_END,
+    TG_ALIGN_STRETCH
+} TG_Align;
+
+typedef enum {
+    TG_VERTICAL,
+    TG_HORIZONTAL
+} TG_Direction;
 
 typedef struct {
     int width;
@@ -14,10 +43,69 @@ typedef struct {
     const char *title;
 } TG_WindowConfig;
 
-bool tg_init(TG_WindowConfig config);
-bool tg_begin_frame(void);
-void tg_end_frame(void);
-void tg_shutdown(void);
+/* =========================================================
+   WINDOW API
+   ========================================================= */
+
+bool tg_window(TG_WindowConfig config);
+
+bool tg_poll(void);
+
+void tg_run(void);
+
+void tg_close(void);
+
+/* =========================================================
+   LAYOUT API
+   ========================================================= */
+
+void tg_begin(void);
+void tg_end(void);
+
+void tg_set_padding(float padding);
+void tg_set_spacing(float spacing);
+void tg_set_alignment(TG_Align alignment);
+
+void tg_row_begin(void);
+void tg_row_end(void);
+
+void tg_column_begin(void);
+void tg_column_end(void);
+
+void tg_container_begin(float width, float height);
+void tg_container_end(void);
+
+/* =========================================================
+   WIDGET API
+   ========================================================= */
+
+TG_Widget *tg_label(const char *text);
+
+TG_Widget *tg_button(const char *text);
+
+TG_Widget *tg_textbox(const char *placeholder);
+
+TG_Widget *tg_checkbox(const char *text, bool checked);
+
+TG_Widget *tg_slider(float min, float max, float value);
+
+/* =========================================================
+   WIDGET INTERACTION
+   ========================================================= */
+
+bool tg_clicked(TG_Widget *widget);
+
+void tg_set_text(TG_Widget *widget, const char *text);
+
+const char *tg_get_text(TG_Widget *widget);
+
+void tg_set_checked(TG_Widget *widget, bool checked);
+
+bool tg_is_checked(TG_Widget *widget);
+
+void tg_set_value(TG_Widget *widget, float value);
+
+float tg_get_value(TG_Widget *widget);
 
 #ifdef __cplusplus
 }
@@ -25,70 +113,286 @@ void tg_shutdown(void);
 
 /* =========================================================
    IMPLEMENTATION
-   Define TINYGUI_IMPLEMENTATION in ONE C file.
    ========================================================= */
 
 #ifdef TINYGUI_IMPLEMENTATION
 
-#include <objc/objc.h>
-#include <objc/runtime.h>
-#include <objc/message.h>
+#import <AppKit/AppKit.h>
+#import <Foundation/Foundation.h>
 
+#include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
-#include <stdio.h>
 
-/* Minimal Cocoa-compatible geometry structures */
+/* =========================================================
+   CONFIGURATION
+   ========================================================= */
+
+#define TG_MAX_WIDGETS 256
+#define TG_MAX_LAYOUTS 32
+
+#define TG_DEFAULT_PADDING 20.0f
+#define TG_DEFAULT_SPACING 12.0f
+
+#define TG_ROW_HEIGHT 44.0f
+
+/* =========================================================
+   INTERNAL TYPES
+   ========================================================= */
+
+typedef enum {
+    TG_TYPE_LABEL,
+    TG_TYPE_BUTTON,
+    TG_TYPE_TEXTBOX,
+    TG_TYPE_CHECKBOX,
+    TG_TYPE_SLIDER
+} TG_Type;
+
+struct TG_Widget {
+    void *native;
+    TG_Type type;
+    bool clicked;
+};
 
 typedef struct {
-    double x;
-    double y;
-} TG_Point;
+    float x;
+    float y;
 
-typedef struct {
-    double width;
-    double height;
-} TG_Size;
+    float width;
+    float height;
 
-typedef struct {
-    TG_Point origin;
-    TG_Size size;
-} TG_Rect;
+    float cursor;
 
-/* Cocoa constants */
+    float padding;
+    float spacing;
 
-#define TG_WINDOW_TITLED        (1UL << 0)
-#define TG_WINDOW_CLOSABLE      (1UL << 1)
-#define TG_WINDOW_MINIATURIZABLE (1UL << 2)
-#define TG_WINDOW_RESIZABLE     (1UL << 3)
+    TG_Direction direction;
+    TG_Align alignment;
 
-#define TG_BACKING_BUFFERED 2
-#define TG_ACTIVATION_REGULAR 0
+} TG_Layout;
 
-/* Objective-C runtime function signatures */
+/* =========================================================
+   GLOBAL STATE
+   ========================================================= */
 
-#define TG_MSG(return_type, name, ...) \
-    ((return_type (*)(id, SEL, ##__VA_ARGS__))objc_msgSend)
+static NSApplication *tg_app = nil;
+static NSWindow *tg_native_window = nil;
+static NSView *tg_content = nil;
 
-#define TG_CLASS(name) objc_getClass(name)
-#define TG_SEL(name) sel_registerName(name)
+static NSMutableArray *tg_widgets = nil;
+static NSMutableArray *tg_targets = nil;
 
-static id tg_app = nil;
-static id tg_window = nil;
+static TG_Widget *tg_widget_registry[TG_MAX_WIDGETS];
+
+static int tg_widget_count = 0;
+
+static TG_Layout tg_layout_stack[TG_MAX_LAYOUTS];
+static int tg_layout_count = 0;
+
 static bool tg_initialized = false;
+static bool tg_running = false;
 
-/* Create NSString from C string */
+/* =========================================================
+   OBJECTIVE-C BUTTON TARGET
+   ========================================================= */
 
-static id tg_string(const char *text)
-{
-    return TG_MSG(id, "stringWithUTF8String:", const char *)
-        ((id)TG_CLASS("NSString"),
-         TG_SEL("stringWithUTF8String:"),
-         text);
+@interface TGButtonTarget : NSObject {
+    TG_Widget *widget;
 }
 
-/* Initialize application and create native window */
+- (id)initWithWidget:(TG_Widget *)value;
 
-bool tg_init(TG_WindowConfig config)
+- (void)clicked:(id)sender;
+
+@end
+
+@implementation TGButtonTarget
+
+- (id)initWithWidget:(TG_Widget *)value
+{
+    self = [super init];
+
+    if (self) {
+        widget = value;
+    }
+
+    return self;
+}
+
+- (void)clicked:(id)sender
+{
+    (void)sender;
+
+    if (widget) {
+        widget->clicked = true;
+    }
+}
+
+@end
+
+/* =========================================================
+   APPLICATION DELEGATE
+   ========================================================= */
+
+@interface TGAppDelegate : NSObject
+    <NSApplicationDelegate, NSWindowDelegate>
+@end
+
+@implementation TGAppDelegate
+
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:
+    (NSApplication *)application
+{
+    (void)application;
+
+    return NO;
+}
+
+- (void)windowWillClose:(NSNotification *)notification
+{
+    (void)notification;
+
+    tg_running = false;
+}
+
+@end
+
+static TGAppDelegate *tg_delegate = nil;
+
+/* =========================================================
+   INTERNAL HELPERS
+   ========================================================= */
+
+static NSView *tg_native_view(TG_Widget *widget)
+{
+    if (!widget || !widget->native)
+        return nil;
+
+    return (NSView *)widget->native;
+}
+
+static TG_Layout *tg_current_layout(void)
+{
+    if (tg_layout_count <= 0)
+        return NULL;
+
+    return &tg_layout_stack[tg_layout_count - 1];
+}
+
+static bool tg_push_layout(TG_Layout layout)
+{
+    if (tg_layout_count >= TG_MAX_LAYOUTS)
+        return false;
+
+    tg_layout_stack[tg_layout_count++] = layout;
+
+    return true;
+}
+
+static void tg_pop_layout(void)
+{
+    if (tg_layout_count > 1)
+        tg_layout_count--;
+}
+
+/* =========================================================
+   WIDGET REGISTRY
+   ========================================================= */
+
+static TG_Widget *tg_register_widget(
+    NSView *native,
+    TG_Type type
+)
+{
+    if (!native || !tg_content)
+        return NULL;
+
+    if (tg_widget_count >= TG_MAX_WIDGETS) {
+        [native release];
+        return NULL;
+    }
+
+    TG_Widget *widget = calloc(1, sizeof(TG_Widget));
+
+    if (!widget) {
+        [native release];
+        return NULL;
+    }
+
+    widget->native = native;
+    widget->type = type;
+
+    [tg_content addSubview:native];
+
+    /* The content view now retains the native control. */
+    [native release];
+
+    tg_widget_registry[tg_widget_count++] = widget;
+
+    [tg_widgets addObject:
+        [NSValue valueWithPointer:widget]];
+
+    return widget;
+}
+
+/* =========================================================
+   LAYOUT ENGINE
+   ========================================================= */
+
+static NSRect tg_next_frame(float width, float height)
+{
+    TG_Layout *layout = tg_current_layout();
+
+    if (!layout || !tg_content)
+        return NSZeroRect;
+
+    float x = layout->x + layout->padding;
+    float y = layout->y + layout->padding;
+
+    if (layout->direction == TG_HORIZONTAL) {
+        x += layout->cursor;
+
+        layout->cursor += width + layout->spacing;
+
+        if (layout->alignment == TG_ALIGN_CENTER)
+            y += (layout->height - height) / 2.0f;
+
+        if (layout->alignment == TG_ALIGN_END)
+            y += layout->height - height - layout->padding;
+
+        if (layout->alignment == TG_ALIGN_STRETCH)
+            height = layout->height - 2.0f * layout->padding;
+    }
+    else {
+        y += layout->cursor;
+
+        layout->cursor += height + layout->spacing;
+
+        if (layout->alignment == TG_ALIGN_CENTER)
+            x += (layout->width - width) / 2.0f;
+
+        if (layout->alignment == TG_ALIGN_END)
+            x += layout->width - width - layout->padding;
+
+        if (layout->alignment == TG_ALIGN_STRETCH)
+            width = layout->width - 2.0f * layout->padding;
+    }
+
+    /* Convert top-left layout coordinates to Cocoa coordinates. */
+
+    float content_height =
+        (float)tg_content.bounds.size.height;
+
+    float native_y = content_height - y - height;
+
+    return NSMakeRect(x, native_y, width, height);
+}
+
+/* =========================================================
+   WINDOW IMPLEMENTATION
+   ========================================================= */
+
+bool tg_window(TG_WindowConfig config)
 {
     if (tg_initialized)
         return false;
@@ -99,152 +403,594 @@ bool tg_init(TG_WindowConfig config)
     if (!config.title)
         return false;
 
-    /* Get NSApplication */
+    @autoreleasepool {
 
-    id app_class = (id)TG_CLASS("NSApplication");
+        tg_app = [NSApplication sharedApplication];
 
-    tg_app = TG_MSG(id, "sharedApplication")
-        (app_class, TG_SEL("sharedApplication"));
+        [tg_app setActivationPolicy:
+            NSApplicationActivationPolicyRegular];
 
-    if (!tg_app)
-        return false;
+        tg_delegate = [[TGAppDelegate alloc] init];
 
-    /* Activate application */
+        [tg_app setDelegate:tg_delegate];
 
-    TG_MSG(void, "setActivationPolicy:", long)
-        (tg_app, TG_SEL("setActivationPolicy:"),
-         TG_ACTIVATION_REGULAR);
+        NSRect frame = NSMakeRect(
+            100,
+            100,
+            config.width,
+            config.height
+        );
 
-    /* Create window rectangle */
+        NSWindowStyleMask style =
+            NSWindowStyleMaskTitled |
+            NSWindowStyleMaskClosable |
+            NSWindowStyleMaskMiniaturizable |
+            NSWindowStyleMaskResizable;
 
-    TG_Rect rect = {
-        .origin = { 100, 100 },
-        .size = {
-            (double)config.width,
-            (double)config.height
+        tg_native_window = [[NSWindow alloc]
+            initWithContentRect:frame
+            styleMask:style
+            backing:NSBackingStoreBuffered
+            defer:NO];
+
+        if (!tg_native_window) {
+            [tg_delegate release];
+            tg_delegate = nil;
+
+            return false;
         }
-    };
 
-    unsigned long style =
-        TG_WINDOW_TITLED |
-        TG_WINDOW_CLOSABLE |
-        TG_WINDOW_MINIATURIZABLE |
-        TG_WINDOW_RESIZABLE;
+        [tg_native_window setTitle:
+            [NSString stringWithUTF8String:config.title]];
 
-    /* Allocate NSWindow */
+        [tg_native_window setReleasedWhenClosed:NO];
 
-    id window_class = (id)TG_CLASS("NSWindow");
+        [tg_native_window setDelegate:tg_delegate];
 
-    tg_window = TG_MSG(id, "alloc")
-        (window_class, TG_SEL("alloc"));
+        tg_content = [tg_native_window contentView];
 
-    tg_window = TG_MSG(id, "initWithContentRect:styleMask:backing:defer:",
-                       TG_Rect, unsigned long, unsigned long, bool)
-        (tg_window,
-         TG_SEL("initWithContentRect:styleMask:backing:defer:"),
-         rect,
-         style,
-         TG_BACKING_BUFFERED,
-         false);
+        tg_widgets = [[NSMutableArray alloc] init];
 
-    if (!tg_window)
-        return false;
+        tg_targets = [[NSMutableArray alloc] init];
 
-    /* Set window title */
+        tg_widget_count = 0;
+        tg_layout_count = 0;
 
-    id title = tg_string(config.title);
+        memset(
+            tg_widget_registry,
+            0,
+            sizeof(tg_widget_registry)
+        );
 
-    TG_MSG(void, "setTitle:", id)
-        (tg_window, TG_SEL("setTitle:"), title);
+        TG_Layout root = {
+            .x = 0,
+            .y = 0,
+            .width = (float)config.width,
+            .height = (float)config.height,
+            .cursor = 0,
+            .padding = TG_DEFAULT_PADDING,
+            .spacing = TG_DEFAULT_SPACING,
+            .direction = TG_VERTICAL,
+            .alignment = TG_ALIGN_START
+        };
 
-    /* Keep window alive after close */
+        tg_push_layout(root);
 
-    TG_MSG(void, "setReleasedWhenClosed:", bool)
-        (tg_window, TG_SEL("setReleasedWhenClosed:"), false);
+        [tg_native_window center];
 
-    /* Show window */
+        [tg_native_window makeKeyAndOrderFront:nil];
 
-    TG_MSG(void, "makeKeyAndOrderFront:", id)
-        (tg_window, TG_SEL("makeKeyAndOrderFront:"), nil);
+        [tg_app activateIgnoringOtherApps:YES];
 
-    /* Activate application */
-
-    TG_MSG(void, "activateIgnoringOtherApps:", bool)
-        (tg_app, TG_SEL("activateIgnoringOtherApps:"), true);
-
-    tg_initialized = true;
+        tg_initialized = true;
+        tg_running = true;
+    }
 
     return true;
 }
 
-/* Process macOS events */
+/* =========================================================
+   EVENT LOOP
+   ========================================================= */
 
-bool tg_begin_frame(void)
+bool tg_poll(void)
 {
-    if (!tg_initialized || !tg_window)
+    if (!tg_initialized || !tg_running)
         return false;
 
-    id date_class = (id)TG_CLASS("NSDate");
+    @autoreleasepool {
 
-    id date = TG_MSG(id, "dateWithTimeIntervalSinceNow:", double)
-        (date_class,
-         TG_SEL("dateWithTimeIntervalSinceNow:"),
-         1.0 / 60.0);
+        NSDate *deadline =
+            [NSDate dateWithTimeIntervalSinceNow:1.0 / 60.0];
 
-    /* Default Cocoa run loop mode */
+        NSEvent *event = [tg_app
+            nextEventMatchingMask:NSEventMaskAny
+            untilDate:deadline
+            inMode:NSDefaultRunLoopMode
+            dequeue:YES];
 
-    extern id NSDefaultRunLoopMode;
+        if (event) {
+            [tg_app sendEvent:event];
+        }
 
-    id event = TG_MSG(id, "nextEventMatchingMask:untilDate:inMode:dequeue:",
-                      unsigned long, id, id, bool)
-        (tg_app,
-         TG_SEL("nextEventMatchingMask:untilDate:inMode:dequeue:"),
-         ~0UL,
-         date,
-         NSDefaultRunLoopMode,
-         true);
+        [tg_app updateWindows];
 
-    if (event) {
-        TG_MSG(void, "sendEvent:", id)
-            (tg_app, TG_SEL("sendEvent:"), event);
+        if (!tg_native_window.isVisible)
+            tg_running = false;
     }
 
-    TG_MSG(void, "updateWindows")
-        (tg_app, TG_SEL("updateWindows"));
-
-    bool visible = TG_MSG(bool, "isVisible")
-        (tg_window, TG_SEL("isVisible"));
-
-    return visible;
+    return tg_running;
 }
 
-/* End frame */
+void tg_run(void)
+{
+    while (tg_poll()) {
+        /* Cocoa events are processed in tg_poll(). */
+    }
+}
 
-void tg_end_frame(void)
+/* =========================================================
+   LAYOUT API
+   ========================================================= */
+
+void tg_begin(void)
 {
     if (!tg_initialized)
         return;
 
-    TG_MSG(void, "updateWindows")
-        (tg_app, TG_SEL("updateWindows"));
+    TG_Layout root = {
+        .x = 0,
+        .y = 0,
+        .width = (float)tg_content.bounds.size.width,
+        .height = (float)tg_content.bounds.size.height,
+        .cursor = 0,
+        .padding = TG_DEFAULT_PADDING,
+        .spacing = TG_DEFAULT_SPACING,
+        .direction = TG_VERTICAL,
+        .alignment = TG_ALIGN_START
+    };
+
+    tg_layout_count = 0;
+
+    tg_push_layout(root);
 }
 
-/* Cleanup */
+void tg_end(void)
+{
+    /* Layout construction is complete. */
+}
 
-void tg_shutdown(void)
+void tg_set_padding(float padding)
+{
+    TG_Layout *layout = tg_current_layout();
+
+    if (layout && padding >= 0)
+        layout->padding = padding;
+}
+
+void tg_set_spacing(float spacing)
+{
+    TG_Layout *layout = tg_current_layout();
+
+    if (layout && spacing >= 0)
+        layout->spacing = spacing;
+}
+
+void tg_set_alignment(TG_Align alignment)
+{
+    TG_Layout *layout = tg_current_layout();
+
+    if (!layout)
+        return;
+
+    if (alignment < TG_ALIGN_START ||
+        alignment > TG_ALIGN_STRETCH)
+        return;
+
+    layout->alignment = alignment;
+}
+
+/* =========================================================
+   ROW
+   ========================================================= */
+
+void tg_row_begin(void)
+{
+    TG_Layout *parent = tg_current_layout();
+
+    if (!parent)
+        return;
+
+    TG_Layout row = {
+        .x = parent->x + parent->padding,
+        .y = parent->y + parent->padding + parent->cursor,
+        .width = parent->width - 2.0f * parent->padding,
+        .height = TG_ROW_HEIGHT,
+        .cursor = 0,
+        .padding = 0,
+        .spacing = parent->spacing,
+        .direction = TG_HORIZONTAL,
+        .alignment = TG_ALIGN_CENTER
+    };
+
+    parent->cursor += row.height + parent->spacing;
+
+    tg_push_layout(row);
+}
+
+void tg_row_end(void)
+{
+    tg_pop_layout();
+}
+
+/* =========================================================
+   COLUMN
+   ========================================================= */
+
+void tg_column_begin(void)
+{
+    TG_Layout *parent = tg_current_layout();
+
+    if (!parent)
+        return;
+
+    float available_height =
+        parent->height -
+        parent->cursor -
+        2.0f * parent->padding;
+
+    TG_Layout column = {
+        .x = parent->x + parent->padding,
+        .y = parent->y + parent->padding + parent->cursor,
+        .width = parent->width - 2.0f * parent->padding,
+        .height = available_height,
+        .cursor = 0,
+        .padding = 0,
+        .spacing = parent->spacing,
+        .direction = TG_VERTICAL,
+        .alignment = TG_ALIGN_START
+    };
+
+    tg_push_layout(column);
+}
+
+void tg_column_end(void)
+{
+    tg_pop_layout();
+}
+
+/* =========================================================
+   CONTAINER
+   ========================================================= */
+
+void tg_container_begin(float width, float height)
+{
+    if (width <= 0 || height <= 0)
+        return;
+
+    if (tg_layout_count >= TG_MAX_LAYOUTS)
+        return;
+
+    NSRect rect = tg_next_frame(width, height);
+
+    float top_y =
+        (float)tg_content.bounds.size.height -
+        (float)NSMaxY(rect);
+
+    TG_Layout container = {
+        .x = (float)rect.origin.x,
+        .y = top_y,
+        .width = width,
+        .height = height,
+        .cursor = 0,
+        .padding = 12,
+        .spacing = 8,
+        .direction = TG_VERTICAL,
+        .alignment = TG_ALIGN_START
+    };
+
+    tg_push_layout(container);
+}
+
+void tg_container_end(void)
+{
+    tg_pop_layout();
+}
+
+/* =========================================================
+   LABEL
+   ========================================================= */
+
+TG_Widget *tg_label(const char *text)
+{
+    if (!tg_initialized || !text)
+        return NULL;
+
+    @autoreleasepool {
+
+        NSTextField *field = [[NSTextField alloc]
+            initWithFrame:tg_next_frame(250, 24)];
+
+        [field setStringValue:
+            [NSString stringWithUTF8String:text]];
+
+        [field setEditable:NO];
+        [field setSelectable:NO];
+        [field setBordered:NO];
+        [field setDrawsBackground:NO];
+
+        return tg_register_widget(field, TG_TYPE_LABEL);
+    }
+}
+
+/* =========================================================
+   BUTTON
+   ========================================================= */
+
+TG_Widget *tg_button(const char *text)
+{
+    if (!tg_initialized || !text)
+        return NULL;
+
+    @autoreleasepool {
+
+        NSButton *button = [[NSButton alloc]
+            initWithFrame:tg_next_frame(150, 32)];
+
+        [button setTitle:
+            [NSString stringWithUTF8String:text]];
+
+        [button setButtonType:NSButtonTypeMomentaryPushIn];
+
+        [button setBezelStyle:NSBezelStyleRounded];
+
+        TG_Widget *widget =
+            tg_register_widget(button, TG_TYPE_BUTTON);
+
+        if (!widget)
+            return NULL;
+
+        TGButtonTarget *target =
+            [[TGButtonTarget alloc] initWithWidget:widget];
+
+        [tg_targets addObject:target];
+
+        [button setTarget:target];
+
+        [button setAction:@selector(clicked:)];
+
+        [target release];
+
+        return widget;
+    }
+}
+
+/* =========================================================
+   TEXTBOX
+   ========================================================= */
+
+TG_Widget *tg_textbox(const char *placeholder)
+{
+    if (!tg_initialized)
+        return NULL;
+
+    @autoreleasepool {
+
+        NSTextField *field = [[NSTextField alloc]
+            initWithFrame:tg_next_frame(250, 30)];
+
+        if (placeholder) {
+            [field setPlaceholderString:
+                [NSString stringWithUTF8String:placeholder]];
+        }
+
+        return tg_register_widget(field, TG_TYPE_TEXTBOX);
+    }
+}
+
+/* =========================================================
+   CHECKBOX
+   ========================================================= */
+
+TG_Widget *tg_checkbox(const char *text, bool checked)
+{
+    if (!tg_initialized || !text)
+        return NULL;
+
+    @autoreleasepool {
+
+        NSButton *button = [[NSButton alloc]
+            initWithFrame:tg_next_frame(200, 24)];
+
+        [button setTitle:
+            [NSString stringWithUTF8String:text]];
+
+        [button setButtonType:NSButtonTypeSwitch];
+
+        [button setState:
+            checked ? NSControlStateValueOn :
+                      NSControlStateValueOff];
+
+        return tg_register_widget(button, TG_TYPE_CHECKBOX);
+    }
+}
+
+/* =========================================================
+   SLIDER
+   ========================================================= */
+
+TG_Widget *tg_slider(float min, float max, float value)
+{
+    if (!tg_initialized || max <= min)
+        return NULL;
+
+    @autoreleasepool {
+
+        NSSlider *slider = [[NSSlider alloc]
+            initWithFrame:tg_next_frame(250, 28)];
+
+        [slider setMinValue:min];
+        [slider setMaxValue:max];
+        [slider setFloatValue:value];
+
+        return tg_register_widget(slider, TG_TYPE_SLIDER);
+    }
+}
+
+/* =========================================================
+   BUTTON INTERACTION
+   ========================================================= */
+
+bool tg_clicked(TG_Widget *widget)
+{
+    if (!widget || widget->type != TG_TYPE_BUTTON)
+        return false;
+
+    bool clicked = widget->clicked;
+
+    widget->clicked = false;
+
+    return clicked;
+}
+
+/* =========================================================
+   TEXT API
+   ========================================================= */
+
+void tg_set_text(TG_Widget *widget, const char *text)
+{
+    if (!widget || !text)
+        return;
+
+    @autoreleasepool {
+
+        if (widget->type != TG_TYPE_TEXTBOX &&
+            widget->type != TG_TYPE_LABEL)
+            return;
+
+        NSTextField *field =
+            (NSTextField *)tg_native_view(widget);
+
+        [field setStringValue:
+            [NSString stringWithUTF8String:text]];
+    }
+}
+
+const char *tg_get_text(TG_Widget *widget)
+{
+    if (!widget)
+        return "";
+
+    if (widget->type != TG_TYPE_TEXTBOX &&
+        widget->type != TG_TYPE_LABEL)
+        return "";
+
+    NSTextField *field =
+        (NSTextField *)tg_native_view(widget);
+
+    return [[field stringValue] UTF8String];
+}
+
+/* =========================================================
+   CHECKBOX API
+   ========================================================= */
+
+void tg_set_checked(TG_Widget *widget, bool checked)
+{
+    if (!widget || widget->type != TG_TYPE_CHECKBOX)
+        return;
+
+    NSButton *button =
+        (NSButton *)tg_native_view(widget);
+
+    [button setState:
+        checked ? NSControlStateValueOn :
+                  NSControlStateValueOff];
+}
+
+bool tg_is_checked(TG_Widget *widget)
+{
+    if (!widget || widget->type != TG_TYPE_CHECKBOX)
+        return false;
+
+    NSButton *button =
+        (NSButton *)tg_native_view(widget);
+
+    return [button state] == NSControlStateValueOn;
+}
+
+/* =========================================================
+   SLIDER API
+   ========================================================= */
+
+void tg_set_value(TG_Widget *widget, float value)
+{
+    if (!widget || widget->type != TG_TYPE_SLIDER)
+        return;
+
+    NSSlider *slider =
+        (NSSlider *)tg_native_view(widget);
+
+    [slider setFloatValue:value];
+}
+
+float tg_get_value(TG_Widget *widget)
+{
+    if (!widget || widget->type != TG_TYPE_SLIDER)
+        return 0.0f;
+
+    NSSlider *slider =
+        (NSSlider *)tg_native_view(widget);
+
+    return [slider floatValue];
+}
+
+/* =========================================================
+   CLEANUP
+   ========================================================= */
+
+void tg_close(void)
 {
     if (!tg_initialized)
         return;
 
-    if (tg_window) {
-        TG_MSG(void, "close")
-            (tg_window, TG_SEL("close"));
+    @autoreleasepool {
 
-        tg_window = nil;
+        tg_running = false;
+
+        if (tg_native_window) {
+            [tg_native_window setDelegate:nil];
+            [tg_native_window close];
+        }
+
+        if (tg_app) {
+            [tg_app setDelegate:nil];
+        }
+
+        for (int i = 0; i < tg_widget_count; i++) {
+            free(tg_widget_registry[i]);
+            tg_widget_registry[i] = NULL;
+        }
+
+        tg_widget_count = 0;
+        tg_layout_count = 0;
+
+        [tg_widgets release];
+        [tg_targets release];
+
+        [tg_native_window release];
+        [tg_delegate release];
+
+        tg_widgets = nil;
+        tg_targets = nil;
+
+        tg_native_window = nil;
+        tg_content = nil;
+        tg_delegate = nil;
+        tg_app = nil;
+
+        tg_initialized = false;
     }
-
-    tg_app = nil;
-    tg_initialized = false;
 }
 
 #endif /* TINYGUI_IMPLEMENTATION */
